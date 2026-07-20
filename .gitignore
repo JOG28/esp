@@ -1,0 +1,13 @@
+# PlatformIO - archivos de compilación (no subir)
+.pio/
+
+# Archivos de VSCode (opcional, puedes quitarlo si quieres compartir tu configuración)
+.vscode/
+
+# Archivos de Python
+__pycache__/
+*.pyc
+
+# Archivos temporales de Windows
+Thumbs.db
+desktop.ini
