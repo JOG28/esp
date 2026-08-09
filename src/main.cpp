@@ -5,58 +5,76 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <HardwareSerial.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 
 // ---------------------------------------------------------
 // PINES DE HARDWARE
 // ---------------------------------------------------------
-// PZEM: PZEM-TX va a Pin5 (RX del ESP32), PZEM-RX va a Pin6 (TX del ESP32)
-#define PZEM_RX_PIN 5 // ESP32 recibe datos del PZEM TX
-#define PZEM_TX_PIN 6 // ESP32 envía datos al PZEM RX
-#define RELAY_PIN 4
+#define PZEM_RX_PIN 5
+#define PZEM_TX_PIN 6
+#define RELAY_PIN   4
+#define BOOT_BTN_PIN 0 // Botón BOOT del ESP32
 
 // ---------------------------------------------------------
-// PZEM - MODBUS RTU (Raw, sin librería)
+// BACKEND — URL para sincronizar datos (Modelo PUSH)
 // ---------------------------------------------------------
-#define PZEM_SERIAL Serial2
-#define PZEM_ADDR 0x01 // Dirección confirmada del módulo
+#define BACKEND_SYNC_URL "http://78.12.10.160/dispositivos/sync"
+
+// ---------------------------------------------------------
+// PZEM - MODBUS RTU
+// ---------------------------------------------------------
+#define PZEM_SERIAL   Serial2
+#define PZEM_ADDR     0x01
 #define RESPONSE_SIZE 25
-#define READ_TIMEOUT 400
+#define READ_TIMEOUT  400
 
 // ---------------------------------------------------------
 // CONSTANTES BLE
 // ---------------------------------------------------------
-#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
 // ---------------------------------------------------------
 // VARIABLES GLOBALES
 // ---------------------------------------------------------
-WebServer server(80);
-bool wifiConnected = false;
-bool relayState = false;
-bool pzemReady = false;
+WebServer   server(80);
+Preferences prefs;
 
-// Variables de los datos leídos del PZEM
-float g_voltage = 0.0;
-float g_current = 0.0;
-float g_power = 0.0;
-float g_energy = 0.0;
+bool wifiConnected        = false;
+bool relayState           = false;
+bool pzemReady            = false;
+
+float g_voltage   = 0.0;
+float g_current   = 0.0;
+float g_power     = 0.0;
+float g_energy    = 0.0;
 float g_frequency = 0.0;
-float g_pf = 0.0;
+float g_pf        = 0.0;
 
-// Variables para provisión de Wi-Fi vía BLE
-String wifi_ssid = "";
+String wifi_ssid     = "";
 String wifi_password = "";
 bool newCredentialsReceived = false;
 
-// Variables del modelo de detección de anomalías
 String current_device_type = "Ninguno";
-float standby_power_max = 0.0;
-float active_power_min = 0.0;
-float active_power_max = 0.0;
-bool anomaly_detected = false;
+float standby_power_max    = 0.0;
+float active_power_min     = 0.0;
+float active_power_max     = 0.0;
+bool anomaly_detected      = false;
+
+BLECharacteristic *g_pChar = nullptr;
+
+// ---------------------------------------------------------
+// Prototipos
+// ---------------------------------------------------------
+void handleGetStatus();
+void handlePostRelay();
+void handleUpdateProfile();
+void handleUpdateWiFi();
+void connectWiFiAndSetup(const String& ssid, const String& password);
+void syncWithBackend();
 
 // ---------------------------------------------------------
 // MODBUS RTU - CRC16
@@ -66,79 +84,113 @@ uint16_t modbusCRC16(const uint8_t *buf, int len) {
   for (int i = 0; i < len; i++) {
     crc ^= buf[i];
     for (int j = 0; j < 8; j++) {
-      if (crc & 0x0001)
-        crc = (crc >> 1) ^ 0xA001;
-      else
-        crc >>= 1;
+      if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
+      else              crc >>= 1;
     }
   }
   return crc;
 }
 
 // ---------------------------------------------------------
-// MODBUS RTU - Leer PZEM (10 registros = todos los datos)
+// MODBUS RTU - Leer PZEM
 // ---------------------------------------------------------
 bool readPZEM() {
   uint8_t cmd[8];
   cmd[0] = PZEM_ADDR;
-  cmd[1] = 0x04; // Read Input Registers
-  cmd[2] = 0x00; // Start Hi
-  cmd[3] = 0x00; // Start Lo
-  cmd[4] = 0x00; // Num regs Hi
-  cmd[5] = 0x0A; // Num regs Lo (10 registros)
+  cmd[1] = 0x04;
+  cmd[2] = 0x00;
+  cmd[3] = 0x00;
+  cmd[4] = 0x00;
+  cmd[5] = 0x0A;
 
   uint16_t crc = modbusCRC16(cmd, 6);
   cmd[6] = crc & 0xFF;
   cmd[7] = (crc >> 8) & 0xFF;
 
-  // Limpiar buffer de entrada
-  while (PZEM_SERIAL.available())
-    PZEM_SERIAL.read();
-
-  // Enviar comando
+  while (PZEM_SERIAL.available()) PZEM_SERIAL.read();
   PZEM_SERIAL.write(cmd, 8);
 
-  // Esperar respuesta
   uint8_t response[RESPONSE_SIZE];
   unsigned long startTime = millis();
   int index = 0;
   while ((millis() - startTime) < READ_TIMEOUT && index < RESPONSE_SIZE) {
-    if (PZEM_SERIAL.available()) {
-      response[index++] = PZEM_SERIAL.read();
-    }
+    if (PZEM_SERIAL.available()) response[index++] = PZEM_SERIAL.read();
   }
 
-  if (index != RESPONSE_SIZE)
-    return false;
+  if (index != RESPONSE_SIZE) return false;
 
-  // Verificar CRC
-  uint16_t respCRC = modbusCRC16(response, RESPONSE_SIZE - 2);
-  uint16_t receivedCRC =
-      (response[RESPONSE_SIZE - 1] << 8) | response[RESPONSE_SIZE - 2];
-  if (respCRC != receivedCRC)
-    return false;
-  if (response[0] != PZEM_ADDR || response[1] != 0x04)
-    return false;
+  uint16_t respCRC     = modbusCRC16(response, RESPONSE_SIZE - 2);
+  uint16_t receivedCRC = (response[RESPONSE_SIZE - 1] << 8) | response[RESPONSE_SIZE - 2];
+  if (respCRC != receivedCRC)                    return false;
+  if (response[0] != PZEM_ADDR || response[1] != 0x04) return false;
 
-  // Parsear y guardar en variables globales
-  g_voltage = ((response[3] << 8) | response[4]) / 10.0;
-  g_current = (((uint32_t)(response[7] << 8) | response[8]) << 16 |
-               ((uint32_t)(response[5] << 8) | response[6])) /
-              1000.0;
-  g_power = (((uint32_t)(response[11] << 8) | response[12]) << 16 |
-             ((uint32_t)(response[9] << 8) | response[10])) /
-            10.0;
-  g_energy = (((uint32_t)(response[15] << 8) | response[16]) << 16 |
-              ((uint32_t)(response[13] << 8) | response[14])) /
-             1000.0;
+  g_voltage   = ((response[3] << 8) | response[4]) / 10.0;
+  g_current   = (((uint32_t)(response[7] << 8) | response[8]) << 16 |
+                  ((uint32_t)(response[5] << 8) | response[6])) / 1000.0;
+  g_power     = (((uint32_t)(response[11] << 8) | response[12]) << 16 |
+                  ((uint32_t)(response[9] << 8) | response[10])) / 10.0;
+  g_energy    = (((uint32_t)(response[15] << 8) | response[16]) << 16 |
+                  ((uint32_t)(response[13] << 8) | response[14])) / 1000.0;
   g_frequency = ((response[17] << 8) | response[18]) / 10.0;
-  g_pf = ((response[19] << 8) | response[20]) / 100.0;
+  g_pf        = ((response[19] << 8) | response[20]) / 100.0;
 
   return true;
 }
 
 // ---------------------------------------------------------
-// CALLBACKS BLE (Recibir credenciales Wi-Fi desde la App)
+// SINCRONIZAR CON AWS (Modelo PUSH)
+// ---------------------------------------------------------
+void syncWithBackend() {
+  String mac = WiFi.macAddress();
+  String ip  = WiFi.localIP().toString();
+
+  StaticJsonDocument<300> doc;
+  doc["mac_address"]      = mac;
+  doc["ip_local"]         = ip; // Para compatibilidad
+  doc["voltage"]          = g_voltage;
+  doc["current"]          = g_current;
+  doc["power"]            = g_power;
+  doc["energy"]           = g_energy;
+  doc["frequency"]        = g_frequency;
+  doc["power_factor"]     = g_pf;
+  doc["relay_state"]      = relayState ? "ON" : "OFF";
+  doc["anomaly_detected"] = anomaly_detected;
+
+  String body;
+  serializeJson(doc, body);
+
+  HTTPClient http;
+  http.begin(BACKEND_SYNC_URL);
+  http.addHeader("Content-Type", "application/json");
+
+  int httpCode = http.POST(body);
+  if (httpCode > 0) {
+    String payload = http.getString();
+    // Parsear respuesta para ver si AWS nos mandó apagar o encender el Relay
+    StaticJsonDocument<256> respDoc;
+    DeserializationError error = deserializeJson(respDoc, payload);
+    if (!error) {
+      if (respDoc.containsKey("relay_command") && !respDoc["relay_command"].isNull()) {
+        String cmd = respDoc["relay_command"].as<String>();
+        if (cmd == "ON" && !relayState) {
+          relayState = true;
+          digitalWrite(RELAY_PIN, LOW); // Lógica LOW: encendido
+          Serial.println("[Sync] Comando recibido de AWS: Rele ON");
+        } else if (cmd == "OFF" && relayState) {
+          relayState = false;
+          digitalWrite(RELAY_PIN, HIGH); // Lógica LOW: apagado
+          Serial.println("[Sync] Comando recibido de AWS: Rele OFF");
+        }
+      }
+    }
+  } else {
+    Serial.printf("[Sync] Error HTTP de conexion con AWS: %d\n", httpCode);
+  }
+  http.end();
+}
+
+// ---------------------------------------------------------
+// CALLBACKS BLE
 // ---------------------------------------------------------
 class MyCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
@@ -148,10 +200,10 @@ class MyCallbacks : public BLECharacteristicCallbacks {
       StaticJsonDocument<256> doc;
       DeserializationError error = deserializeJson(doc, rxValue);
       if (!error) {
-        wifi_ssid = doc["ssid"].as<String>();
+        wifi_ssid     = doc["ssid"].as<String>();
         wifi_password = doc["pass"].as<String>();
         newCredentialsReceived = true;
-        Serial.println("BLE: Credenciales Wi-Fi extraídas correctamente.");
+        Serial.println("BLE: Credenciales extraídas correctamente.");
       } else {
         Serial.println("BLE: Error al parsear JSON.");
       }
@@ -159,15 +211,35 @@ class MyCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
+// Callback del SERVIDOR BLE para reiniciar advertising cuando el celular se desconecta
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) {
+    Serial.println("BLE: Cliente conectado.");
+  }
+
+  void onDisconnect(BLEServer *pServer) {
+    Serial.println("BLE: Cliente desconectado. Reiniciando advertising...");
+    // CRUCIAL: Si el celular se desconecta sin enviar credenciales,
+    // volver a anunciar para que lo pueda encontrar de nuevo
+    delay(500);
+    BLEDevice::startAdvertising();
+    Serial.println("BLE: Anunciando de nuevo como 'ESP32_EnergyMonitor'...");
+  }
+};
+
 void initBLE() {
   BLEDevice::init("ESP32_EnergyMonitor");
-  BLEServer *pServer = BLEDevice::createServer();
+  BLEServer  *pServer  = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());  // <-- Reiniciar advertising al desconectar
   BLEService *pService = pServer->createService(SERVICE_UUID);
 
-  BLECharacteristic *pChar = pService->createCharacteristic(
+  g_pChar = pService->createCharacteristic(
       CHARACTERISTIC_UUID,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
-  pChar->setCallbacks(new MyCallbacks());
+      BLECharacteristic::PROPERTY_READ  |
+      BLECharacteristic::PROPERTY_WRITE |
+      BLECharacteristic::PROPERTY_NOTIFY);
+  g_pChar->addDescriptor(new BLE2902());
+  g_pChar->setCallbacks(new MyCallbacks());
   pService->start();
 
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
@@ -176,35 +248,114 @@ void initBLE() {
   pAdvertising->setMinPreferred(0x06);
   pAdvertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
-  Serial.println("BLE: Anunciando como 'ESP32_EnergyMonitor'. Esperando "
-                 "credenciales Wi-Fi...");
+  Serial.println("BLE: Anunciando como 'ESP32_EnergyMonitor'...");
 }
 
 // ---------------------------------------------------------
-// HANDLERS DEL SERVIDOR WEB
+// CONECTAR WIFI Y COMPLETAR SETUP
 // ---------------------------------------------------------
-void handleGetStatus() {
-  // Leer datos frescos del PZEM
-  bool ok = readPZEM();
-  if (!ok) {
-    g_voltage = 0.0;
-    g_current = 0.0;
-    g_power = 0.0;
-    g_energy = 0.0;
+void connectWiFiAndSetup(const String& ssid, const String& password) {
+  Serial.println("Wi-Fi: Conectando a '" + ssid + "'...");
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi: Error al conectar. Borrando credenciales y reiniciando...");
+    prefs.begin("wifi", false);
+    prefs.clear();
+    prefs.end();
+    delay(1000);
+    ESP.restart();
+    return;
   }
 
-  StaticJsonDocument<256> doc;
-  doc["mac_address"] = WiFi.macAddress();
-  doc["voltage"] = g_voltage;
-  doc["current"] = g_current;
-  doc["power"] = g_power;
-  doc["energy"] = g_energy;
-  doc["frequency"] = g_frequency;
-  doc["power_factor"] = g_pf;
-  doc["relay_state"] = relayState ? "ON" : "OFF";
-  doc["device_type"] = current_device_type;
-  doc["anomaly_detected"] = anomaly_detected;
+  wifiConnected = true;
+  Serial.println("Wi-Fi: Conectado!");
+  Serial.print("Wi-Fi: IP local: ");
+  Serial.println(WiFi.localIP());
+  Serial.println("Wi-Fi: MAC: " + WiFi.macAddress());
 
+  // Guardar credenciales en NVS para arranques futuros
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", password);
+  prefs.end();
+  Serial.println("NVS: Credenciales guardadas.");
+
+  // Forzamos la primera sincronizacion con AWS para "registrar" el dispositivo
+  syncWithBackend();
+
+  // Notificar MAC al app por BLE y cerrar BLE
+  if (g_pChar != nullptr) {
+    String mac = WiFi.macAddress();
+    Serial.println("BLE: Notificando MAC: " + mac);
+    g_pChar->setValue(mac.c_str());
+    g_pChar->notify();
+    delay(800);
+    BLEDevice::deinit(true);
+    g_pChar = nullptr;
+    Serial.println("BLE: Apagado.");
+  }
+
+  // Mantener los endpoints locales por si acaso, aunque ya no se usarán desde AWS
+  server.on("/api/status",         HTTP_GET,  handleGetStatus);
+  server.on("/api/relay",          HTTP_POST, handlePostRelay);
+  server.on("/api/update_profile", HTTP_POST, handleUpdateProfile);
+  server.on("/api/wifi",           HTTP_POST, handleUpdateWiFi);
+  server.begin();
+  Serial.println("HTTP: Servidor local de respaldo iniciado");
+}
+
+// ---------------------------------------------------------
+// HANDLERS DEL SERVIDOR WEB (Respaldo Local)
+// ---------------------------------------------------------
+void handleUpdateWiFi() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!server.hasArg("plain")) {
+    server.send(400, "text/plain", "Body not received");
+    return;
+  }
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  if (!doc.containsKey("ssid") || !doc.containsKey("pass")) {
+    server.send(400, "text/plain", "Missing 'ssid' or 'pass'");
+    return;
+  }
+  String newSsid = doc["ssid"].as<String>();
+  String newPass = doc["pass"].as<String>();
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", newSsid);
+  prefs.putString("pass", newPass);
+  prefs.end();
+  server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Wi-Fi actualizado. Reiniciando...\"}");
+  delay(1000);
+  ESP.restart();
+}
+
+void handleGetStatus() {
+  bool ok = readPZEM();
+  if (!ok) { g_voltage = 0.0; g_current = 0.0; g_power = 0.0; g_energy = 0.0; }
+  StaticJsonDocument<256> doc;
+  doc["mac_address"]      = WiFi.macAddress();
+  doc["voltage"]          = g_voltage;
+  doc["current"]          = g_current;
+  doc["power"]            = g_power;
+  doc["energy"]           = g_energy;
+  doc["frequency"]        = g_frequency;
+  doc["power_factor"]     = g_pf;
+  doc["relay_state"]      = relayState ? "ON" : "OFF";
+  doc["device_type"]      = current_device_type;
+  doc["anomaly_detected"] = anomaly_detected;
   String response;
   serializeJson(doc, response);
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -217,25 +368,21 @@ void handlePostRelay() {
     server.send(400, "text/plain", "Body not received");
     return;
   }
-
   StaticJsonDocument<200> doc;
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "text/plain", "Invalid JSON");
     return;
   }
-
   if (doc.containsKey("state")) {
     String state = doc["state"].as<String>();
     if (state == "ON" || state == "on") {
       relayState = true;
-      digitalWrite(RELAY_PIN, HIGH);
+      digitalWrite(RELAY_PIN, LOW);
     } else if (state == "OFF" || state == "off") {
       relayState = false;
-      digitalWrite(RELAY_PIN, LOW);
+      digitalWrite(RELAY_PIN, HIGH);
     }
-    server.send(200, "application/json",
-                "{\"status\":\"success\",\"relay_state\":\"" +
-                    String(relayState ? "ON" : "OFF") + "\"}");
+    server.send(200, "application/json", "{\"status\":\"success\",\"relay_state\":\"" + String(relayState ? "ON" : "OFF") + "\"}");
   } else {
     server.send(400, "text/plain", "Missing 'state' in JSON");
   }
@@ -243,29 +390,14 @@ void handlePostRelay() {
 
 void handleUpdateProfile() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  if (!server.hasArg("plain")) {
-    server.send(400, "text/plain", "Body not received");
-    return;
-  }
-
+  if (!server.hasArg("plain")) return;
   StaticJsonDocument<200> doc;
-  if (deserializeJson(doc, server.arg("plain"))) {
-    server.send(400, "text/plain", "Invalid JSON");
-    return;
-  }
-
-  if (doc.containsKey("device_type"))
-    current_device_type = doc["device_type"].as<String>();
-  if (doc.containsKey("standby_power_max"))
-    standby_power_max = doc["standby_power_max"].as<float>();
-  if (doc.containsKey("active_power_min"))
-    active_power_min = doc["active_power_min"].as<float>();
-  if (doc.containsKey("active_power_max"))
-    active_power_max = doc["active_power_max"].as<float>();
-
-  server.send(200, "application/json",
-              "{\"status\":\"success\",\"message\":\"Perfil actualizado a " +
-                  current_device_type + "\"}");
+  if (deserializeJson(doc, server.arg("plain"))) return;
+  if (doc.containsKey("device_type"))     current_device_type = doc["device_type"].as<String>();
+  if (doc.containsKey("standby_power_max")) standby_power_max = doc["standby_power_max"].as<float>();
+  if (doc.containsKey("active_power_min"))  active_power_min  = doc["active_power_min"].as<float>();
+  if (doc.containsKey("active_power_max"))  active_power_max  = doc["active_power_max"].as<float>();
+  server.send(200, "application/json", "{\"status\":\"success\"}");
 }
 
 // ---------------------------------------------------------
@@ -273,86 +405,79 @@ void handleUpdateProfile() {
 // ---------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-
-  // Iniciar puerto serie del PZEM
   PZEM_SERIAL.begin(9600, SERIAL_8N1, PZEM_RX_PIN, PZEM_TX_PIN);
 
-  // Configurar Relé
+  // Boton BOOT para borrar memoria y forzar Bluetooth
+  pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+
+  // RELAY - Inicia APAGADO (lógica Invertida: HIGH es OFF)
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(RELAY_PIN, HIGH);
   relayState = false;
 
   Serial.println("\n========================================");
-  Serial.println("  Monitor de Energía ESP32-S3 v2.0");
+  Serial.println("  Monitor de Energía ESP32-S3 v4.0 (AWS PUSH)");
   Serial.println("========================================");
-  Serial.printf("  PZEM: Serial2 | RX=Pin%d | TX=Pin%d | Addr=0x%02X\n",
-                PZEM_RX_PIN, PZEM_TX_PIN, PZEM_ADDR);
 
-  // Verificar comunicación con el PZEM
+  // Checkear si el boton de BOOT esta presionado al arrancar para borrar WiFi
+  if (digitalRead(BOOT_BTN_PIN) == LOW) {
+    Serial.println("\n!!! BOTON BOOT PRESIONADO !!!");
+    Serial.println("Borrando memoria WiFi guardada...");
+    prefs.begin("wifi", false);
+    prefs.clear();
+    prefs.end();
+    Serial.println("Memoria borrada. Reiniciando...\n");
+    delay(2000);
+    ESP.restart();
+  }
+
+  WiFi.mode(WIFI_STA);
+  Serial.println("  Tu MAC Address es: " + WiFi.macAddress());
+  Serial.println("  Manten presionado el boton BOOT al encender si quieres borrar la WiFi.");
+  Serial.println("========================================");
+
   delay(1500);
-  Serial.println("  Verificando PZEM-004T v4.0...");
   if (readPZEM()) {
     pzemReady = true;
-    Serial.printf("  ¡PZEM OK! Voltaje de red: %.1f V\n", g_voltage);
+    Serial.printf("  PZEM OK! Voltaje: %.1f V\n", g_voltage);
   } else {
-    pzemReady = false;
-    Serial.println("  ¡ADVERTENCIA! No se pudo comunicar con el PZEM.");
-    Serial.println("  Verifica: 1) Cables RX/TX bien conectados");
-    Serial.println("            2) VCC del PZEM en el pin de 5V");
-    Serial.println("            3) 110V conectados al PZEM");
+    Serial.println("  ADVERTENCIA: No se pudo comunicar con el PZEM.");
   }
   Serial.println("========================================\n");
 
-  // Iniciar BLE para recibir credenciales Wi-Fi
-  initBLE();
+  // Intentar cargar credenciales WiFi guardadas en NVS
+  prefs.begin("wifi", true);
+  String saved_ssid = prefs.getString("ssid", "");
+  String saved_pass = prefs.getString("pass", "");
+  prefs.end();
+
+  if (saved_ssid.length() > 0) {
+    // Credenciales guardadas — conectar sin BLE
+    Serial.println("NVS: Credenciales encontradas. Conectando sin BLE...");
+    connectWiFiAndSetup(saved_ssid, saved_pass);
+  } else {
+    // Primera vez — iniciar BLE
+    Serial.println("NVS: Sin credenciales. Iniciando BLE para vinculacion...");
+    initBLE();
+  }
 }
 
 // ---------------------------------------------------------
 // LOOP
 // ---------------------------------------------------------
 void loop() {
-  // 1. Si llegaron credenciales Wi-Fi por BLE, conectar
+  // 1. Si llegaron credenciales por BLE, conectar
   if (newCredentialsReceived && !wifiConnected) {
-    Serial.println("Wi-Fi: Conectando a '" + wifi_ssid + "'...");
-    WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
-
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-      delay(500);
-      Serial.print(".");
-      attempts++;
-    }
-    Serial.println();
-
-    if (WiFi.status() == WL_CONNECTED) {
-      wifiConnected = true;
-      newCredentialsReceived = false;
-      Serial.println("Wi-Fi: ¡Conectado!");
-      Serial.print("Wi-Fi: IP local: ");
-      Serial.println(WiFi.localIP());
-
-      // Apagar BLE para liberar memoria
-      BLEDevice::deinit(true);
-
-      // Registrar rutas del servidor HTTP
-      server.on("/api/status", HTTP_GET, handleGetStatus);
-      server.on("/api/relay", HTTP_POST, handlePostRelay);
-      server.on("/api/update_profile", HTTP_POST, handleUpdateProfile);
-      server.begin();
-      Serial.println("Wi-Fi: Servidor HTTP iniciado.");
-    } else {
-      Serial.println("Wi-Fi: Error al conectar. Reintenta enviando las "
-                     "credenciales por BLE.");
-      newCredentialsReceived = false;
-    }
+    newCredentialsReceived = false;
+    connectWiFiAndSetup(wifi_ssid, wifi_password);
   }
 
-  // 2. Atender clientes HTTP
+  // 2. Atender clientes HTTP (local fallback)
   if (wifiConnected) {
     server.handleClient();
   }
 
-  // 3. Leer PZEM y detectar anomalías cada 5 segundos
+  // 3. Leer PZEM y Sincronizar con AWS cada 5 segundos
   static unsigned long lastRead = 0;
   if (millis() - lastRead > 5000) {
     lastRead = millis();
@@ -360,25 +485,26 @@ void loop() {
     if (readPZEM()) {
       pzemReady = true;
 
-      // Detección de anomalías según el perfil del dispositivo
       if (current_device_type != "Ninguno") {
         if (!relayState) {
-          // Modo Reposo (Relé apagado)
           anomaly_detected = (g_power > standby_power_max);
         } else {
-          // Modo Activo (Relé encendido)
-          anomaly_detected =
-              (g_power < active_power_min || g_power > active_power_max);
+          anomaly_detected = (g_power < active_power_min || g_power > active_power_max);
         }
       }
 
-      Serial.printf("[PZEM] %.1fV | %.3fA | %.1fW | %.3fkWh | %.1fHz | PF:%.2f "
-                    "| Rele:%s | Anomalia:%s\n",
-                    g_voltage, g_current, g_power, g_energy, g_frequency, g_pf,
+      Serial.printf("[PZEM] %.1fV | %.3fA | %.1fW | %.3fkWh | PF:%.2f | Rele:%s | Anomalia:%s\n",
+                    g_voltage, g_current, g_power, g_energy, g_pf,
                     relayState ? "ON" : "OFF", anomaly_detected ? "SI" : "NO");
     } else {
       pzemReady = false;
-      Serial.println("[PZEM] Error de lectura. Verificar conexiones.");
+      // No imprimir cada 5 seg para no saturar el serial
+    }
+
+    // SIEMPRE sincronizar con AWS, tenga PZEM o no
+    // Así el dashboard muestra el dispositivo en línea y el relay funciona
+    if (wifiConnected) {
+      syncWithBackend();
     }
   }
 }
